@@ -5,6 +5,7 @@ const C = Components;
 let currentJob = '';
 let kindFilter = '';
 let lastData = null;
+let renderSeq = 0;   // monotonic request sequence; only the newest may render
 
 function setupFilters() {
   const kinds = [['', '全部 All'], ['map', 'Map'], ['reduce', 'Reduce']];
@@ -17,9 +18,17 @@ function setupFilters() {
 
 async function render() {
   if (!currentJob) return;
+  const jobId = currentJob;
+  const seq = ++renderSeq;
+  let data;
   try {
-    lastData = await API.get('/api/jobs/' + currentJob);
+    data = await API.get('/api/jobs/' + jobId);
   } catch (e) { return; }
+  // Drop stale responses: the user switched jobs, or a newer poll already
+  // rendered fresher data.  Applying an old snapshot would show another
+  // job's numbers or move the bars backwards.
+  if (jobId !== currentJob || seq !== renderSeq) return;
+  lastData = data;
   const job = lastData.job;
   const tasks = lastData.tasks || [];
 

@@ -157,7 +157,9 @@ class WorkerServer:
     def _cancel(self):
         body = request.get_json(silent=True) or {}
         task_id = body.get("task_id", "")
-        return jsonify({"cancelled": self.executor.cancel(task_id) if task_id else False})
+        job_id = body.get("job_id", "")
+        ok = bool(task_id and job_id) and self.executor.cancel(job_id, task_id)
+        return jsonify({"cancelled": ok})
 
     def _get_shuffle(self, job_id: str, task_id: str, partition_name: str):
         index = parse_partition_index(partition_name)

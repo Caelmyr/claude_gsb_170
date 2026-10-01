@@ -158,7 +158,7 @@ class Master:
         return jsonify({
             "jobs_total": len(jobs),
             "jobs_active": len(active),
-            "jobs_succeeded": sum(1 for j in jobs if j.status in (C.JOB_SUCCEEDED, C.JOB_REDUCE)),
+            "jobs_succeeded": sum(1 for j in jobs if j.status == C.JOB_SUCCEEDED),
             "jobs_failed": sum(1 for j in jobs if j.status == C.JOB_FAILED),
             "jobs_cancelled": sum(1 for j in jobs if j.status == C.JOB_CANCELLED),
             "workers": self.registry.summary(),

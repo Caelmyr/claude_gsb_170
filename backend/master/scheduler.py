@@ -237,18 +237,24 @@ class Scheduler:
         if job is None:
             return
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
-        if task is None or task.status == C.TASK_SUCCEEDED:
+        if task is None or task.status in C.TASK_TERMINAL_STATES:
             return
 
         def apply(t: Task) -> None:
+            if t.status in C.TASK_TERMINAL_STATES:
+                return  # a completion landed first; late updates must not touch it
             if t.status in (C.TASK_PENDING, C.TASK_RETRYING, C.TASK_ASSIGNED):
                 t.status = C.TASK_RUNNING
                 t.worker_id = payload.get("worker_id", t.worker_id)
             if not t.started_ms:
                 t.started_ms = now_ms()
-            t.progress = float(payload.get("progress", t.progress))
-            t.records_processed = int(payload.get("records_processed", t.records_processed))
-            t.records_emitted = int(payload.get("records_emitted", t.records_emitted))
+            # Status posts arrive over threaded HTTP and may be reordered, so
+            # progress and counters only ever move forwards within an attempt.
+            t.progress = max(t.progress, float(payload.get("progress", t.progress)))
+            t.records_processed = max(t.records_processed,
+                                      int(payload.get("records_processed", t.records_processed)))
+            t.records_emitted = max(t.records_emitted,
+                                    int(payload.get("records_emitted", t.records_emitted)))
 
         self.job_manager.apply_task(job.job_id, task.task_id, apply)
 
@@ -323,7 +329,8 @@ class Scheduler:
             if worker is not None:
                 try:
                     self.client.post(f"{worker.address}/task/cancel",
-                                     {"task_id": task.task_id}, timeout=2.0)
+                                     {"job_id": job.job_id, "task_id": task.task_id},
+                                     timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
 

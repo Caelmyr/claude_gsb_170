@@ -193,7 +193,10 @@ class Executor:
         self.config = config
         self.exec_mode = exec_mode
         self.client = HttpClient(timeout=8.0, retries=2)
-        self._handles: dict[str, dict] = {}
+        # Handles are keyed by (job_id, task_id): task ids are only unique
+        # within a job (``m-0000``), so keying by task id alone would let two
+        # concurrent jobs reject or cancel each other's tasks on this worker.
+        self._handles: dict[tuple[str, str], dict] = {}
         self._lock = threading.Lock()
         self._tmp_dir = os.path.join(data_root, "tmp")
         os.makedirs(self._tmp_dir, exist_ok=True)
@@ -206,44 +209,47 @@ class Executor:
 
     def running_task_ids(self) -> list[str]:
         with self._lock:
-            return list(self._handles.keys())
+            return [f"{job_id}/{task_id}" for job_id, task_id in self._handles]
 
     # -- dispatch -----------------------------------------------------
     def start_task(self, spec: dict) -> bool:
-        task_id = spec["task_id"]
+        key = (spec["job_id"], spec["task_id"])
         # Inject config-derived execution parameters so the Master does not need
         # to know worker-local tuning (spill threshold, temp directory).
         spec = dict(spec)
         spec.setdefault("spill_records", int(getattr(self.config, "shuffle_spill_records", 20000)))
         spec.setdefault("tmp_dir", self._tmp_dir)
         with self._lock:
-            if task_id in self._handles:
+            if key in self._handles:
                 return False
-            self._handles[task_id] = {
+            self._handles[key] = {
                 "spec": spec,
                 "started_ms": now_ms(),
                 "cancel": threading.Event(),
                 "last_status_ms": 0,
             }
         runner = self._run_process if self.exec_mode == "process" else self._run_thread
-        threading.Thread(target=runner, args=(task_id,), daemon=True, name=f"task-{task_id}").start()
+        threading.Thread(target=runner, args=(key,), daemon=True,
+                         name=f"task-{key[0]}-{key[1]}").start()
         return True
 
-    def cancel(self, task_id: str) -> bool:
+    def cancel(self, job_id: str, task_id: str) -> bool:
         with self._lock:
-            handle = self._handles.get(task_id)
+            handle = self._handles.get((job_id, task_id))
         if handle:
             handle["cancel"].set()
             return True
         return False
 
     def shutdown(self) -> None:
-        for task_id in self.running_task_ids():
-            self.cancel(task_id)
+        with self._lock:
+            keys = list(self._handles.keys())
+        for job_id, task_id in keys:
+            self.cancel(job_id, task_id)
 
     # -- thread backend ----------------------------------------------
-    def _run_thread(self, task_id: str) -> None:
-        handle = self._handles[task_id]
+    def _run_thread(self, key: tuple[str, str]) -> None:
+        handle = self._handles[key]
         spec = handle["spec"]
 
         def progress_cb(progress: float, processed: int, emitted: int) -> None:
@@ -252,20 +258,20 @@ class Executor:
         try:
             result = _execute_task(spec, self.data_root, progress_cb)
             result["status"] = C.TASK_SUCCEEDED
-            self._complete(task_id, result)
+            self._complete(key, result)
         except Exception as exc:  # noqa: BLE001
-            self._complete(task_id, {
+            self._complete(key, {
                 "status": C.TASK_FAILED,
                 "error": f"{type(exc).__name__}: {exc}",
             })
         finally:
-            self._remove(task_id)
+            self._remove(key)
 
     # -- process backend ---------------------------------------------
-    def _run_process(self, task_id: str) -> None:
-        handle = self._handles[task_id]
+    def _run_process(self, key: tuple[str, str]) -> None:
+        handle = self._handles[key]
         spec = handle["spec"]
-        work_dir = os.path.join(self._tmp_dir, f"task-{task_id}-{now_ms()}")
+        work_dir = os.path.join(self._tmp_dir, f"task-{key[0]}-{key[1]}-{now_ms()}")
         os.makedirs(work_dir, exist_ok=True)
         progress_path = os.path.join(work_dir, "progress.json")
         result_path = os.path.join(work_dir, "result.json")
@@ -285,8 +291,8 @@ class Executor:
             if handle["cancel"].is_set():
                 proc.terminate()
                 proc.join(timeout=2.0)
-                self._complete(task_id, {"status": C.TASK_FAILED, "error": "cancelled"})
-                self._remove(task_id)
+                self._complete(key, {"status": C.TASK_FAILED, "error": "cancelled"})
+                self._remove(key)
                 return
             time.sleep(0.25)
             prog = read_json(progress_path)
@@ -296,8 +302,8 @@ class Executor:
         proc.join()
 
         result = read_json(result_path, default={"status": C.TASK_FAILED, "error": "no result file"})
-        self._complete(task_id, result)
-        self._remove(task_id)
+        self._complete(key, result)
+        self._remove(key)
 
     # -- reporting to master -----------------------------------------
     def _post(self, path: str, payload: dict) -> None:
@@ -324,13 +330,13 @@ class Executor:
             "records_emitted": emitted,
         })
 
-    def _complete(self, task_id: str, result: dict) -> None:
-        handle = self._handles.get(task_id)
+    def _complete(self, key: tuple[str, str], result: dict) -> None:
+        handle = self._handles.get(key)
         spec = handle["spec"] if handle else {}
         self._post("/api/workers/task-complete", {
             "worker_id": self.worker_id,
-            "job_id": spec.get("job_id", ""),
-            "task_id": task_id,
+            "job_id": spec.get("job_id", key[0]),
+            "task_id": spec.get("task_id", key[1]),
             "kind": spec.get("kind", ""),
             "status": result.get("status", C.TASK_FAILED),
             "records_processed": result.get("records_processed", 0),
@@ -341,6 +347,6 @@ class Executor:
             "error": result.get("error", ""),
         })
 
-    def _remove(self, task_id: str) -> None:
+    def _remove(self, key: tuple[str, str]) -> None:
         with self._lock:
-            self._handles.pop(task_id, None)
+            self._handles.pop(key, None)

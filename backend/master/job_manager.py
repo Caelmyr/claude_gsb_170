@@ -214,7 +214,10 @@ class JobManager:
             for t in stage_tasks:
                 counts[t.status] = counts.get(t.status, 0) + 1
             total = len(stage_tasks)
-            done = counts[C.TASK_SUCCEEDED] + counts[C.TASK_RUNNING]
+            # Only fully succeeded tasks count as done: a RUNNING task has not
+            # finished any verifiable work, and counting it would push the bar
+            # ahead of the task table (and let it fall back on retry).
+            done = counts[C.TASK_SUCCEEDED]
             progress[stage] = {
                 "total": total,
                 "done": done,

@@ -3,11 +3,16 @@ Components.init('shuffle');
 const C = Components;
 
 let currentJob = '';
+let renderSeq = 0;
 
 async function render() {
   if (!currentJob) return;
+  const jobId = currentJob;
+  const seq = ++renderSeq;
   let m;
-  try { m = await API.get('/api/jobs/' + currentJob + '/shuffle'); } catch (e) { return; }
+  try { m = await API.get('/api/jobs/' + jobId + '/shuffle'); } catch (e) { return; }
+  // Ignore stale responses (job switched or a newer poll finished first).
+  if (jobId !== currentJob || seq !== renderSeq) return;
   const parts = m.partitions || [];
 
   document.getElementById('stats').innerHTML = [

@@ -2,9 +2,13 @@
 Components.init('home');
 const C = Components;
 
+let loadSeq = 0;
+
 async function load() {
+  const seq = ++loadSeq;
   let ov;
   try { ov = await API.get('/api/overview'); } catch (e) { return; }
+  if (seq !== loadSeq) return;   // a newer poll already rendered fresher data
   const w = ov.workers;
 
   document.getElementById('stats').innerHTML = [
