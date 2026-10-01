@@ -184,15 +184,14 @@ class Master:
         return jsonify({"jobs": [self.job_manager.job_summary(j) for j in self.job_manager.list_jobs()]})
 
     def _job_detail(self, job_id: str):
-        job, err, code = self._get_job(job_id)
-        if job is None:
-            return err, code
-        summary = self.job_manager.job_summary(job)
-        summary["shuffle"] = self.shuffle.progress(job)
+        snapshot = self.job_manager.job_snapshot(job_id)
+        if snapshot is None:
+            return jsonify({"error": f"unknown job {job_id}"}), 404
+        summary, tasks = snapshot
         summary["fault_count"] = len(self.fault_tolerance.list_faults(job_id))
         return jsonify({
             "job": summary,
-            "tasks": [self._task_view(t) for t in self.job_manager.tasks_for(job_id)],
+            "tasks": [self._task_view(t) for t in tasks],
         })
 
     def _job_cancel(self, job_id: str):

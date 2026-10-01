@@ -33,16 +33,21 @@ class TestFaultTolerance(unittest.TestCase):
 
     def test_retry_then_permanent_failure(self):
         task = self.jm.tasks_for(self.job.job_id, "map")[0]
-        # First failure -> retry.
+        # First and second failures are retryable; attempts are consumed when a
+        # replacement dispatch is accepted by a worker.
         self.assertTrue(self.ft.handle_task_failure(self.job, task, "boom"))
         task = self.jm.get_task(self.job.job_id, task.task_id)
         self.assertEqual(task.status, "RETRYING")
-        self.assertEqual(task.attempts, 1)
-        # Exhaust retries until the job fails.
-        retried = True
-        while retried:
-            retried = self.ft.handle_task_failure(self.job, task, "boom")
-            task = self.jm.get_task(self.job.job_id, task.task_id)
+        self.assertEqual(task.attempts, 0)
+        self.jm.update_task(self.job.job_id, task.task_id, status="ASSIGNED", attempts=1)
+
+        self.assertTrue(self.ft.handle_task_failure(self.job, task, "boom"))
+        task = self.jm.get_task(self.job.job_id, task.task_id)
+        self.assertEqual(task.status, "RETRYING")
+        self.jm.update_task(self.job.job_id, task.task_id, status="ASSIGNED", attempts=2)
+
+        self.assertFalse(self.ft.handle_task_failure(self.job, task, "boom"))
+        task = self.jm.get_task(self.job.job_id, task.task_id)
         self.assertEqual(task.status, "FAILED")
         self.assertEqual(self.jm.get_job(self.job.job_id).status, "FAILED")
 

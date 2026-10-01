@@ -204,45 +204,81 @@ class JobManager:
     # ------------------------------------------------------------------
     # Derived views
     # ------------------------------------------------------------------
-    def stage_progress(self, job: Job) -> dict:
-        tasks = self.tasks_for(job.job_id)
+    def stage_progress(self, job: Job, tasks: Optional[list[Task]] = None) -> dict:
+        """Return progress counts derived from authoritative task/job states.
+
+        Only ``SUCCEEDED`` tasks count as completed.  ``ASSIGNED``, ``RUNNING``
+        and ``RETRYING`` represent work that has not finished, so including any
+        of them here would let the progress bar get ahead of the task table.
+        The shuffle artifact is built atomically with the MAP -> SHUFFLE
+        transition; once that stage state is observable it is complete.
+        """
+        if tasks is None:
+            tasks = self.tasks_for(job.job_id)
+
         progress: dict = {}
         for stage, kind in ((C.STAGE_MAP, C.TASK_MAP), (C.STAGE_REDUCE, C.TASK_REDUCE)):
             stage_tasks = [t for t in tasks if t.kind == kind]
-            counts = {C.TASK_PENDING: 0, C.TASK_ASSIGNED: 0, C.TASK_RUNNING: 0,
-                      C.TASK_RETRYING: 0, C.TASK_SUCCEEDED: 0, C.TASK_FAILED: 0}
+            counts = {state: 0 for state in (
+                C.TASK_PENDING, C.TASK_ASSIGNED, C.TASK_RUNNING,
+                C.TASK_RETRYING, C.TASK_SUCCEEDED, C.TASK_FAILED,
+            )}
             for t in stage_tasks:
                 counts[t.status] = counts.get(t.status, 0) + 1
             total = len(stage_tasks)
-            done = counts[C.TASK_SUCCEEDED] + counts[C.TASK_RUNNING]
+            done = counts[C.TASK_SUCCEEDED]
             progress[stage] = {
                 "total": total,
                 "done": done,
                 "pct": round(done / total * 100.0, 1) if total else 0.0,
                 "counts": counts,
             }
+
+        shuffle_finished = (
+            job.status in (C.JOB_SHUFFLE, C.JOB_REDUCE, C.JOB_SUCCEEDED)
+            or bool(job.stats.get("shuffle_started_ms", 0))
+        )
+        total_shuffle = max(job.num_reduce_tasks, 0)
+        done_shuffle = total_shuffle if shuffle_finished else 0
+        progress[C.STAGE_SHUFFLE] = {
+            "total": total_shuffle,
+            "done": done_shuffle,
+            "pct": 100.0 if shuffle_finished and total_shuffle else 0.0,
+        }
         return progress
 
-    def job_summary(self, job: Job) -> dict:
-        tasks = self.tasks_for(job.job_id)
-        by_status: dict[str, int] = {}
-        for t in tasks:
-            by_status[t.status] = by_status.get(t.status, 0) + 1
-        return {
-            "job_id": job.job_id,
-            "name": job.name,
-            "mapper": job.mapper,
-            "reducer": job.reducer,
-            "status": job.status,
-            "num_map_tasks": job.num_map_tasks,
-            "num_reduce_tasks": job.num_reduce_tasks,
-            "input_rows": job.input_rows,
-            "created_ms": job.created_ms,
-            "started_ms": job.started_ms,
-            "finished_ms": job.finished_ms,
-            "error": job.error,
-            "params": job.params,
-            "stats": job.stats,
-            "task_status": by_status,
-            "stage_progress": self.stage_progress(job),
-        }
+    def job_snapshot(self, job_id: str) -> Optional[tuple[dict, list[Task]]]:
+        """Read a job summary and its tasks as one synchronized snapshot."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            tasks = list(self._tasks.get(job_id, {}).values())
+            tasks.sort(key=lambda t: (t.kind, t.index))
+            return self.job_summary(job, tasks), tasks
+
+    def job_summary(self, job: Job, tasks: Optional[list[Task]] = None) -> dict:
+        with self._lock:
+            if tasks is None:
+                tasks = list(self._tasks.get(job.job_id, {}).values())
+            by_status: dict[str, int] = {}
+            for t in tasks:
+                by_status[t.status] = by_status.get(t.status, 0) + 1
+            return {
+                "job_id": job.job_id,
+                "name": job.name,
+                "mapper": job.mapper,
+                "reducer": job.reducer,
+                "status": job.status,
+                "num_map_tasks": job.num_map_tasks,
+                "num_reduce_tasks": job.num_reduce_tasks,
+                "input_rows": job.input_rows,
+                "created_ms": job.created_ms,
+                "started_ms": job.started_ms,
+                "finished_ms": job.finished_ms,
+                "error": job.error,
+                "params": job.params,
+                "stats": job.stats,
+                "task_status": by_status,
+                "stage_progress": self.stage_progress(job, tasks),
+            }

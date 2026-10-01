@@ -70,13 +70,12 @@ class FaultTolerance:
             self._record(
                 job, "task_failed", f"task {task.task_id} failed ({error}); retrying",
                 task=task, worker_id=worker_id,
-                detail={"attempt": task.attempts + 1, "max_attempts": max_attempts,
+                detail={"attempt": task.attempts, "max_attempts": max_attempts,
                         "backoff_ms": backoff_ms},
             )
             self.job_manager.update_task(
                 job.job_id, task.task_id,
                 status=C.TASK_RETRYING, worker_id=None, error=error,
-                attempts=task.attempts + 1,
                 retry_after_ms=now_ms() + backoff_ms,
                 progress=0.0, records_processed=0, records_emitted=0,
             )
@@ -86,8 +85,10 @@ class FaultTolerance:
             job, "task_failed", f"task {task.task_id} exhausted {max_attempts} attempts",
             task=task, worker_id=worker_id,
         )
-        self.job_manager.update_task(job.job_id, task.task_id, status=C.TASK_FAILED,
-                                     error=error, attempts=task.attempts + 1)
+        self.job_manager.update_task(
+            job.job_id, task.task_id, status=C.TASK_FAILED,
+            error=error, progress=0.0,
+        )
         self.job_manager.fail(job, f"task {task.task_id} failed after {max_attempts} attempts: {error}")
         return False
 
@@ -108,6 +109,8 @@ class FaultTolerance:
                         job.job_id, task.task_id,
                         status=C.TASK_RETRYING, worker_id=None,
                         error=f"worker {worker.name} died", retry_after_ms=0,
+                        progress=0.0, records_processed=0, records_emitted=0,
+                        started_ms=0, assigned_ms=0, finished_ms=0, duration_ms=0,
                     )
                     reassigned += 1
         return reassigned

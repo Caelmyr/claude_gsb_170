@@ -103,11 +103,12 @@ class Scheduler:
             self._dispatch_tasks(job, C.TASK_MAP)
             map_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_MAP)
             if map_tasks and all(t.status == C.TASK_SUCCEEDED for t in map_tasks):
-                self.shuffle.build(job)
-                self.job_manager.apply_job(job.job_id, lambda j: (
-                    setattr(j, "status", C.JOB_SHUFFLE),
-                    j.stats.__setitem__("shuffle_started_ms", now_ms()),
-                ))
+                def advance_to_shuffle(j: Job) -> None:
+                    self.shuffle.build(j)
+                    j.status = C.JOB_SHUFFLE
+                    j.stats["shuffle_started_ms"] = now_ms()
+
+                self.job_manager.apply_job(job.job_id, advance_to_shuffle)
                 self.logbus.info(job.job_id, "all map tasks finished; shuffle built",
                                  task_id="shuffle")
         elif status == C.JOB_SHUFFLE:
@@ -194,8 +195,10 @@ class Scheduler:
         def mark_dispatched(t: Task) -> None:
             t.status = C.TASK_ASSIGNED
             t.assigned_ms = now_ms()
+            t.error = ""
             if not speculative:
                 t.worker_id = worker.worker_id
+                t.attempts += 1
             else:
                 stats = dict(t.stats or {})
                 stats.setdefault("speculative_workers", []).append(worker.worker_id)
@@ -217,7 +220,7 @@ class Scheduler:
             "mapper": job.mapper,
             "reducer": job.reducer,
             "params": job.params,
-            "attempt": 0,
+            "attempt": task.attempts,
             "simulate_failure": bool(job.params.get("simulate_failure", False)),
         }
         if task.kind == C.TASK_MAP:
@@ -241,14 +244,22 @@ class Scheduler:
             return
 
         def apply(t: Task) -> None:
-            if t.status in (C.TASK_PENDING, C.TASK_RETRYING, C.TASK_ASSIGNED):
-                t.status = C.TASK_RUNNING
-                t.worker_id = payload.get("worker_id", t.worker_id)
+            attempt = int(payload.get("attempt", t.attempts))
+            if attempt != t.attempts:
+                return  # delayed report from an obsolete attempt
+            if t.status not in (C.TASK_ASSIGNED, C.TASK_RUNNING):
+                return
+            reporter = payload.get("worker_id", "")
+            speculative_workers = set((t.stats or {}).get("speculative_workers", []))
+            if reporter != t.worker_id and reporter not in speculative_workers:
+                return
+            t.status = C.TASK_RUNNING
             if not t.started_ms:
                 t.started_ms = now_ms()
-            t.progress = float(payload.get("progress", t.progress))
-            t.records_processed = int(payload.get("records_processed", t.records_processed))
-            t.records_emitted = int(payload.get("records_emitted", t.records_emitted))
+            progress = min(1.0, max(0.0, float(payload.get("progress", t.progress))))
+            t.progress = max(t.progress, progress)
+            t.records_processed = max(t.records_processed, int(payload.get("records_processed", t.records_processed)))
+            t.records_emitted = max(t.records_emitted, int(payload.get("records_emitted", t.records_emitted)))
 
         self.job_manager.apply_task(job.job_id, task.task_id, apply)
 
@@ -259,18 +270,25 @@ class Scheduler:
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
         if task is None or task.status == C.TASK_SUCCEEDED:
             return  # duplicate completion from a speculative loser
+        attempt = int(payload.get("attempt", task.attempts))
+        if attempt != task.attempts:
+            return  # stale completion from a superseded attempt
 
         worker_id = payload.get("worker_id", "")
         status = payload.get("status", C.TASK_FAILED)
 
         if status != C.TASK_SUCCEEDED:
             self.registry.task_finished(worker_id, success=False)
+            speculative_workers = set((task.stats or {}).get("speculative_workers", []))
+            if worker_id != task.worker_id and worker_id in speculative_workers:
+                return  # a speculative copy failed; the primary attempt is still authoritative
             self.fault_tolerance.handle_task_failure(job, task, payload.get("error", ""), worker_id)
             return
 
         # Success path.
         def apply(t: Task) -> None:
             t.status = C.TASK_SUCCEEDED
+            t.worker_id = worker_id or t.worker_id
             t.progress = 1.0
             t.records_processed = int(payload.get("records_processed", 0))
             t.records_emitted = int(payload.get("records_emitted", 0))
@@ -284,6 +302,7 @@ class Scheduler:
             t.stats = stats
 
         self.job_manager.apply_task(job.job_id, task.task_id, apply)
+        task = self.job_manager.get_task(job.job_id, task.task_id)
         self.registry.task_finished(worker_id, success=True)
         self.metrics.record_task(job, task, int(payload.get("duration_ms", 0)))
 
@@ -323,7 +342,7 @@ class Scheduler:
             if worker is not None:
                 try:
                     self.client.post(f"{worker.address}/task/cancel",
-                                     {"task_id": task.task_id}, timeout=2.0)
+                                     {"job_id": job.job_id, "task_id": task.task_id}, timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
 

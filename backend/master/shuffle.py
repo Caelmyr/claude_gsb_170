@@ -119,7 +119,7 @@ class ShuffleCoordinator:
         partitions.sort(key=lambda d: d.get("partition", 0))
 
         total_bytes = sum(d.get("total_bytes", 0) for d in partitions)
-        done = sum(1 for d in partitions if d.get("status") in ("done", "ready"))
+        done = sum(1 for d in partitions if d.get("status") == "done")
         return {
             "job_id": job.job_id,
             "num_partitions": len(partitions),
